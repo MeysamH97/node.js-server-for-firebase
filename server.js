@@ -33,7 +33,6 @@ const io = socketIo(server, {
   }
 });
 
-
 // اضافه کردن یک مجموعه برای مدیریت توکن‌ها
 const tokensCollection = db.collection('activeTokens');
 
@@ -66,19 +65,19 @@ app.post('/login', async (req, res) => {
     }
 
     const userDoc = userSnapshot.docs[0];
-    const userData = userDoc.data();
+    const data = userDoc.data();
     
     // Verify password using bcrypt
-    const passwordMatch = await bcrypt.compare(password, userData.password);
+    const passwordMatch = await bcrypt.compare(password, data.password);
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid password' });
     }
 
     // Generate JWT token
-    const token = jwt.sign({ userId: userData.id }, SECRET_KEY, { expiresIn: '1h' });
-    await addToken(userData.id, token);  // Store token in the database
+    const token = jwt.sign({ userId: data.id }, SECRET_KEY, { expiresIn: '1h' });
+    await addToken(data.id, token);  // Store token in the database
 
-    res.status(200).json({ userData, token }); // Return user data along with token
+    res.status(200).json({ data, token }); // Return user data along with token
   } catch (error) {
     console.error('Error logging in:', error);
     res.status(401).json({ error: 'Failed to log in' });
@@ -107,20 +106,24 @@ app.get('/checkToken', verifyToken, (req, res) => {
 
 // Middleware to verify token
 async function verifyToken(req, res, next) {
-  const token = req.body['token'];
+
+  const token = req.headers['authorization']; 
   const userId = req.body['userId'];
+
+  const tokenWithoutBearer = token.startsWith('Bearer ') ? token.slice(7) : token;
 
   if (!token || !userId) {
     return res.status(401).json({ error: 'No token provided' });
   }
 
   try {
-    const isValid = await isTokenValid(userId, token);
+    const isValid = await isTokenValid(userId, tokenWithoutBearer);
+
     if (!isValid) {
       return res.status(401).json({ error: 'Invalid token' });
     }
-
-    jwt.verify(token, SECRET_KEY); // Verify the token
+    
+    jwt.verify(tokenWithoutBearer, SECRET_KEY); // Verify the token
     next();
   } catch (error) {
     console.error('Token verification error:', error);
@@ -138,7 +141,7 @@ app.post('/register', async (req, res) => {
     const userRecord = await admin.auth().createUser({ email, password: hashedPassword });
 
     // Store additional user data in Firestore
-    userData = {
+    const data = {
       'id': userRecord.uid,
       'email': email,
       'username': null,
@@ -149,15 +152,37 @@ app.post('/register', async (req, res) => {
       'password': hashedPassword, // Store hashed password
     };
 
-    await admin.firestore().collection('users').doc(userRecord.uid).set(userData);
+    await admin.firestore().collection('users').doc(userRecord.uid).set(data);
+    // Generate JWT token
+    const token = jwt.sign({ userId: data.id }, SECRET_KEY, { expiresIn: '1h' });
+    await addToken(data.id, token);  // Store token in the database
 
-    res.status(200).json(userData);
+    res.status(200).json({ data, token }); // Return user data along with token
   } catch (error) {
     console.error('Error registering user:', error);
     res.status(400).json({ error: 'Failed to register user' });
   }
 });
 
+// Endpoint to get user data by userId
+app.get('/getUser/:userId', verifyToken, async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    // Fetch user data from Firestore
+    const userDoc = await db.collection('users').doc(userId).get();
+    const data = userDoc.data();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.status(200).json(data);
+  } catch (error) {
+    console.error('Error fetching user data:', error);
+    res.status(500).json({ error: 'Failed to fetch user data' });
+  }
+});
 
 // Endpoint for updating user data
 app.put('/updateUser', async (req, res) => {
@@ -169,9 +194,9 @@ app.put('/updateUser', async (req, res) => {
 
     // Fetch updated user data
     const userDoc = await admin.firestore().collection('users').doc(userId).get();
-    const updatedUserData = userDoc.exists ? userDoc.data() : {};
+    const data = userDoc.exists ? userDoc.data() : {};
 
-    res.status(200).json(updatedUserData);
+    res.status(200).json(data);
   } catch (error) {
     console.error('Error updating user data:', error);
     res.status(400).json({ error: 'Failed to update user data' });
@@ -182,33 +207,14 @@ app.put('/updateUser', async (req, res) => {
 io.on('connection', (socket) => {
   console.log('New client connected');
 
-  // Handle fetching data for a specific user
-  socket.on('fetchUserData', async (userId) => {
-    console.log('Received message:', userId); // Print received message
-    console.log(`Fetching data from collection: Users, document: ${userId}`);
-    try {
-      const docRef = db.collection('users').doc(userId);
-      const doc = await docRef.get(); // Fetch specific document from Firestore
-      if (doc.exists) {
-        console.log('userDataFetched', doc.data());
-        console.log('Send data back to the client');
-        socket.emit('userDataFetched', doc.data()); // Send data back to the client
-      } else {
-        console.log('No such document!');
-        socket.emit('error', 'No such document!');
-      }
-    } catch (error) {
-      console.error('Error fetching userData:', error);
-      socket.emit('error', 'Failed to fetch userData');
-    }
-  });
 
   // Firestore listener for changes in a specific document
-  socket.on('watchDocument', (userId) => {
+  socket.on('watchCurrentUserData', (userId) => {
+    console.log(`Listening for changes to user: ${userId}`);
     const docRef = db.collection('users').doc(userId);
     const unsubscribe = docRef.onSnapshot((doc) => {
       if (doc.exists) {
-        socket.emit('documentChanged', doc.data());
+        socket.emit(`currentUserDataChanged_${userId}`, doc.data());
       } else {
         socket.emit('error', 'No such document!');
       }
@@ -217,6 +223,148 @@ io.on('connection', (socket) => {
     // Clean up listener on disconnect
     socket.on('disconnect', () => {
       console.log('Client disconnected');
+      unsubscribe();
+    });
+  });
+
+  socket.on('watchOtherUserData', (contactId) => {
+    console.log(`Listening for changes to contact: ${contactId}`);
+    const docRef = db.collection('users').doc(contactId);
+    
+    const unsubscribe = docRef.onSnapshot((doc) => {
+      if (doc.exists) {
+        socket.emit(`otherUserDataChanged_${contactId}`, doc.data()); // ارسال داده‌ها با یک نام یکتا
+      } else {
+        socket.emit(`error_${contactId}`, 'No such document!');
+      }
+    });
+  
+    // Clean up listener on disconnect or when switching contacts
+    socket.on('disconnect', () => {
+      console.log(`Stopped listening to changes for contact: ${contactId}`);
+      unsubscribe();
+    });
+  });
+
+  // متد ایجاد چت
+  socket.on('createChat', async ({ userId, chatId, title, admins, members, type }) => {
+    try {
+      // از تابع createChat استفاده کنید
+      const generatedChatId = await createChat(userId, chatId, title, admins, members, type);
+      
+      // ارسال نتیجه موفقیت‌آمیز به کلاینت
+      socket.emit(`chatCreated_${userId}`, { success: true, chatId: generatedChatId });
+    } catch (error) {
+      console.error('Error creating chat:', error);
+      socket.emit('chatCreated', { success: false, error: error.message });
+    }
+  });
+
+  // Firestore listener for changes in chat data
+  socket.on('watchChatData', ({ userId, chatId }) => {
+    console.log(`Listening for chat data changes for user: ${userId}, chat: ${chatId}`);
+    const docRef =db.collection('users').doc(userId).collection('chats').doc(chatId);
+    const unsubscribe = docRef.onSnapshot((doc) => {
+      if (doc.exists) {
+        socket.emit(`chatDataChanged_${userId}_${chatId}`, doc.data());
+      } else {
+        socket.emit(`error`, 'No such chat!');
+      }
+    });
+
+    // Clean up listener on disconnect
+    socket.on('disconnect', () => {
+      console.log(`Stopped listening to changes for chat: ${chatId}`);
+      unsubscribe();
+    });
+  });
+
+// متد ایجاد چت
+const createChat = async (userId, chatId, title, admins, members, type) => {
+  try {
+    const generatedChatId = chatId || db.collection('chats').doc().id;
+
+    const chatData = {
+      id: generatedChatId,
+      title: title,
+      owner: userId,
+      admins: admins,
+      members: members,
+      messages: [],
+      isTypings: [],
+      type: type,
+    };
+
+    const chatRef = db.collection('users').doc(userId).collection('chats').doc(generatedChatId);
+    await chatRef.set(chatData);
+
+    const memberUpdates = members.map(async (memberId) => {
+      const userChatRef = db.collection('users').doc(memberId).collection('chats');
+      return userChatRef.doc(generatedChatId).set(chatData);
+    });
+
+    await Promise.all(memberUpdates);
+    
+    return generatedChatId; // برگرداندن ID چت ایجاد شده
+  } catch (error) {
+    console.error('Error creating chat:', error);
+    throw new Error(error.message);
+  }
+};
+
+// ایجاد پیام در یک چت
+socket.on('sendMessage', async ({ userId, chatId, message }) => {
+  try {
+    const chatRef = db.collection('users').doc(userId).collection('chats').doc(chatId);
+    const chatDoc = await chatRef.get();
+
+    // اگر چت وجود ندارد، آن را ایجاد کنید
+    if (!chatDoc.exists) {
+      const users = chatId.split('_');
+      const generatedChatId = await createChat(userId, chatId, '', [users[0],users[1]], [users[0],users[1]], 'private');
+      console.log(`Chat created with ID: ${generatedChatId}`);
+    }
+
+    const messagesRef = chatRef.collection('messages').doc();
+
+    const messageData = {
+      id: messagesRef.id,
+      sender: message['sender'],
+      content: message['content'],
+      time: message['time'] , // استفاده از Timestamp تبدیل شده
+      type: message['type'],
+    };
+
+    await messagesRef.set(messageData);
+    await chatRef.update({
+      messages: admin.firestore.FieldValue.arrayUnion(messagesRef.id),
+      lastMessage: messageData.id,
+    });
+
+    socket.emit(`messageSent_${userId}_${chatId}`, { success: true, messageId: messagesRef.id });
+  } catch (error) {
+    console.error('Error sending message:', error);
+    socket.emit('messageSent', { success: false, error: error.message });
+  }
+});
+
+
+  // Firestore listener for changes in message data
+  socket.on('watchMessageData', ({ userId, chatId, messageId }) => {
+    console.log(`Listening for message data changes for user: ${userId}, chat: ${chatId}, message: ${messageId}`);
+    const docRef = db.collection('users').doc(userId).collection('chats').doc(chatId).collection('messages').doc(messageId);
+    const unsubscribe = docRef.onSnapshot((doc) => {
+      if (doc.exists) {
+        const messageData = doc.data();
+        socket.emit(`messageDataChanged_${userId}_${chatId}_${messageId}`, messageData);
+      } else {
+        socket.emit('error', 'No such message!');
+      }
+    });
+
+    // Clean up listener on disconnect
+    socket.on('disconnect', () => {
+      console.log(`Stopped listening to changes for message: ${messageId}`);
       unsubscribe();
     });
   });
